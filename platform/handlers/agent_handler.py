@@ -47,6 +47,7 @@ from datetime import date, datetime
 from lib.secrets import load_secrets
 load_secrets(os.environ["SECRET_NAME"])
 
+from ads_agent.ingestion import GoogleAdsConnector, GoogleAdsMutator
 from ads_agent.decision_engine import (
     allocate_budget,
     adjust_bids,
@@ -326,33 +327,78 @@ def lambda_handler(event: dict, context) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Mutation stubs — replace with real SDK calls in Phase 2 and 3
+# Mutation implementations
 # ---------------------------------------------------------------------------
 
-def _apply_budget_changes(budget_allocations: dict[str, float]) -> None:
-    """Apply budget changes via Google Ads and Bing APIs.
+def _get_google_mutator() -> GoogleAdsMutator | None:
+    """Instantiate a GoogleAdsMutator if credentials are available."""
+    try:
+        connector = GoogleAdsConnector()
+        return GoogleAdsMutator(connector)
+    except (ValueError, ImportError) as exc:
+        logger.error("Cannot create GoogleAdsMutator: %s", exc)
+        return None
 
-    TODO (Phase 2): Implement GoogleAdsManager.update_campaign_budgets()
-    TODO (Phase 3): Implement BingAdsManager.update_campaign_budgets()
-    """
-    for campaign_id, new_budget in budget_allocations.items():
-        platform = audit._infer_platform(campaign_id)
+
+def _apply_budget_changes(budget_allocations: dict[str, float]) -> None:
+    """Apply budget changes via Google Ads API (Phase 2) and Bing API (Phase 3 stub)."""
+    google_updates = {
+        cid: budget for cid, budget in budget_allocations.items()
+        if audit._infer_platform(cid) == "google"
+    }
+    bing_updates = {
+        cid: budget for cid, budget in budget_allocations.items()
+        if audit._infer_platform(cid) == "microsoft"
+    }
+
+    # Google Ads — live mutations
+    if google_updates:
+        mutator = _get_google_mutator()
+        if mutator:
+            results = mutator.update_campaign_budgets(
+                google_updates,
+                budget_increase_cap=BUDGET_INCREASE_CAP,
+            )
+            for cid, applied in results.items():
+                if applied:
+                    logger.info("[Google] Budget applied for campaign %s: $%.2f", cid, google_updates[cid])
+                else:
+                    logger.warning("[Google] Budget NOT applied for campaign %s", cid)
+        else:
+            logger.error("Google mutator unavailable — budget changes not applied")
+
+    # Microsoft Ads — Phase 3 stub
+    for cid, budget in bing_updates.items():
         logger.info(
-            "[LIVE] Would set %s campaign %s daily budget to $%.2f",
-            platform, campaign_id, new_budget,
+            "[Bing][Phase3Stub] Would set campaign %s daily budget to $%.2f",
+            cid, budget,
         )
 
 
 def _apply_bid_changes(bid_updates: dict[str, dict[str, float]]) -> None:
-    """Apply keyword bid changes via Google Ads and Bing APIs.
+    """Apply keyword bid changes via Google Ads API (Phase 2) and Bing API (Phase 3 stub)."""
+    google_mutator = None
 
-    TODO (Phase 2): Implement GoogleAdsManager.update_keyword_bids()
-    TODO (Phase 3): Implement BingAdsManager.update_keyword_bids()
-    """
     for campaign_id, kw_bids in bid_updates.items():
         platform = audit._infer_platform(campaign_id)
-        for keyword, new_bid in kw_bids.items():
-            logger.info(
-                "[LIVE] Would set %s campaign %s keyword '%s' bid to $%.4f",
-                platform, campaign_id, keyword, new_bid,
-            )
+
+        if platform == "google":
+            if google_mutator is None:
+                google_mutator = _get_google_mutator()
+            if google_mutator:
+                results = google_mutator.update_keyword_bids(kw_bids, campaign_id)
+                for kw, applied in results.items():
+                    if applied:
+                        logger.info("[Google] Bid applied: campaign=%s kw='%s' bid=$%.4f", campaign_id, kw, kw_bids[kw])
+                    else:
+                        logger.warning("[Google] Bid NOT applied: campaign=%s kw='%s'", campaign_id, kw)
+            else:
+                logger.error("Google mutator unavailable — bid changes not applied for campaign %s", campaign_id)
+
+        elif platform == "microsoft":
+            # Phase 3 stub
+            for kw, bid in kw_bids.items():
+                logger.info(
+                    "[Bing][Phase3Stub] Would set campaign %s keyword '%s' bid to $%.4f",
+                    campaign_id, kw, bid,
+                )

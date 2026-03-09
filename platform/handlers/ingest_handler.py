@@ -145,13 +145,15 @@ def lambda_handler(event: dict, context) -> dict:
     # ------------------------------------------------------------------
     try:
         google_connector = GoogleAdsConnector()
-    except ValueError as exc:
+        logger.info("GoogleAdsConnector ready (customer_id=%s)", google_connector.customer_id)
+    except (ValueError, ImportError) as exc:
         logger.error("GoogleAdsConnector init failed: %s", exc)
         google_connector = None
 
     try:
         microsoft_connector = MicrosoftAdsConnector()
-    except ValueError as exc:
+        logger.info("MicrosoftAdsConnector ready (account_id=%s)", microsoft_connector.account_id)
+    except (ValueError, ImportError) as exc:
         logger.error("MicrosoftAdsConnector init failed: %s", exc)
         microsoft_connector = None
 

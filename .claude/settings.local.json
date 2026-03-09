@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python3:*)",
+      "Read(//c/Users/dwolf/AppData/Local/Programs/**)",
+      "Read(//c/usr/**)",
+      "Bash(ls /c/Python*/python.exe)",
+      "Read(//c/Users/dwolf/**)"
+    ]
+  }
+}

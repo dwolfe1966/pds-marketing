@@ -59,14 +59,30 @@ def normalize_campaigns(raw_data: Dict[str, Any]) -> List[Dict[str, Any]]:
         campaigns = datasets.get("campaigns", [])
         for camp in campaigns:
             # Example mapping; adjust field names based on actual API response.
+            cost = (
+                camp.get("cost_micros", 0) / 1e6
+                if camp.get("cost_micros") is not None
+                else camp.get("cost", 0)
+            )
+            conversions = camp.get("conversions", 0)
+            clicks = camp.get("clicks", 0)
+            impressions = camp.get("impressions", 0)
+            budget = (
+                camp.get("budget_micros", 0) / 1e6
+                if camp.get("budget_micros") is not None
+                else camp.get("budget", 0)
+            )
             normalized.append({
                 "platform": platform,
-                "campaign_id": camp.get("id"),
-                "campaign_name": camp.get("name"),
-                "cost": camp.get("cost_micros", 0) / 1e6 if camp.get("cost_micros") is not None else camp.get("cost", 0),
-                "impressions": camp.get("impressions", 0),
-                "clicks": camp.get("clicks", 0),
-                "conversions": camp.get("conversions", 0),
+                "campaign_id": str(camp.get("id") or camp.get("campaign_id", "")),
+                "campaign_name": camp.get("name") or camp.get("campaign_name", ""),
+                "cost": cost,
+                "impressions": impressions,
+                "clicks": clicks,
+                "conversions": conversions,
+                "budget": budget,
+                "cpa": cost / conversions if conversions > 0 else float("inf"),
+                "ctr": clicks / impressions if impressions > 0 else 0.0,
             })
     return normalized
 
