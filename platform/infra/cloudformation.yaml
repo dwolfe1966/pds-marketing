@@ -1,0 +1,491 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Deploys the idlookup.ai advertising agent on AWS.
+  Resources: DynamoDB (CampaignMetrics + AuditTrail), S3 data bucket,
+  SNS alerts topic, 3 Lambda functions, Step Functions Bing poller,
+  EventBridge schedules, and IAM roles.
+
+# ---------------------------------------------------------------------------
+# Parameters
+# ---------------------------------------------------------------------------
+Parameters:
+  StackName:
+    Type: String
+    Default: idlookup-ai-agent
+    Description: Base name for all resources.
+
+  AlertEmail:
+    Type: String
+    Description: Email address to subscribe to the SNS alerts topic.
+
+  DryRun:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: >
+      When "true" the agent logs recommendations but does not apply mutations.
+      Set to "false" to enable live budget and bid changes.
+
+  SecretName:
+    Type: String
+    Default: adsCredentials
+    Description: Name of the Secrets Manager secret containing all API credentials.
+
+  CodeBucket:
+    Type: String
+    Description: S3 bucket containing Lambda deployment ZIP files.
+
+  IngestZipKey:
+    Type: String
+    Default: ingest.zip
+    Description: S3 key for the IngestMetrics Lambda ZIP.
+
+  AgentZipKey:
+    Type: String
+    Default: agent.zip
+    Description: S3 key for the RunAgent Lambda ZIP.
+
+  BingPollerZipKey:
+    Type: String
+    Default: bing_poller.zip
+    Description: S3 key for the BingPoller Lambda ZIP.
+
+  SklearnLayerArn:
+    Type: String
+    Description: ARN of the published sklearn/scipy/numpy Lambda layer.
+
+  CpaTarget:
+    Type: String
+    Default: "18.0"
+    Description: Target cost per acquisition in USD.
+
+  CpaAlertThreshold:
+    Type: String
+    Default: "22.50"
+    Description: CPA value at which an SNS alert fires (default 1.25 x CpaTarget).
+
+  TargetLtv:
+    Type: String
+    Default: "18.0"
+    Description: Estimated 6-month customer lifetime value in USD.
+
+  TotalBudget:
+    Type: String
+    Default: "1000.0"
+    Description: Total daily budget cap across all campaigns in USD.
+
+  BudgetIncreaseCap:
+    Type: String
+    Default: "0.20"
+    Description: Maximum fractional single-step budget increase (0.20 = 20%).
+
+  LogLevel:
+    Type: String
+    Default: INFO
+    AllowedValues: [DEBUG, INFO, WARNING, ERROR]
+
+# ---------------------------------------------------------------------------
+# Conditions
+# ---------------------------------------------------------------------------
+Conditions:
+  HasAlertEmail: !Not [!Equals [!Ref AlertEmail, ""]]
+
+# ---------------------------------------------------------------------------
+# Resources
+# ---------------------------------------------------------------------------
+Resources:
+
+  # ── S3 data bucket ──────────────────────────────────────────────────────
+  MetricsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${StackName}-data-${AWS::AccountId}"
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireRawMetrics
+            Status: Enabled
+            Prefix: raw-metrics/
+            ExpirationInDays: 90
+
+  # ── DynamoDB: CampaignMetrics ────────────────────────────────────────────
+  CampaignMetricsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "${StackName}-CampaignMetrics"
+      BillingMode: PAY_PER_REQUEST
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      AttributeDefinitions:
+        - AttributeName: PK
+          AttributeType: S
+        - AttributeName: SK
+          AttributeType: S
+        - AttributeName: platform
+          AttributeType: S
+      KeySchema:
+        - AttributeName: PK
+          KeyType: HASH
+        - AttributeName: SK
+          KeyType: RANGE
+      GlobalSecondaryIndexes:
+        - IndexName: ByDate
+          KeySchema:
+            - AttributeName: SK
+              KeyType: HASH
+            - AttributeName: PK
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+        - IndexName: ByPlatform
+          KeySchema:
+            - AttributeName: platform
+              KeyType: HASH
+            - AttributeName: SK
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+
+  # ── DynamoDB: AuditTrail ─────────────────────────────────────────────────
+  AuditTrailTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "${StackName}-AuditTrail"
+      BillingMode: PAY_PER_REQUEST
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      AttributeDefinitions:
+        - AttributeName: PK
+          AttributeType: S
+        - AttributeName: SK
+          AttributeType: S
+      KeySchema:
+        - AttributeName: PK
+          KeyType: HASH
+        - AttributeName: SK
+          KeyType: RANGE
+
+  # ── SNS alerts topic ─────────────────────────────────────────────────────
+  AlertsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "${StackName}-Alerts"
+
+  AlertsEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasAlertEmail
+    Properties:
+      TopicArn: !Ref AlertsTopic
+      Protocol: email
+      Endpoint: !Ref AlertEmail
+
+  # ── IAM role shared by all Lambda functions ───────────────────────────────
+  AgentLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${StackName}-LambdaRole"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: AdsAgentPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: SecretsManager
+                Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${SecretName}*"
+              - Sid: DynamoDB
+                Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:GetItem
+                  - dynamodb:Query
+                  - dynamodb:BatchWriteItem
+                  - dynamodb:BatchGetItem
+                Resource:
+                  - !GetAtt CampaignMetricsTable.Arn
+                  - !Sub "${CampaignMetricsTable.Arn}/index/*"
+                  - !GetAtt AuditTrailTable.Arn
+                  - !Sub "${AuditTrailTable.Arn}/index/*"
+              - Sid: S3
+                Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource:
+                  - !GetAtt MetricsBucket.Arn
+                  - !Sub "${MetricsBucket.Arn}/*"
+              - Sid: SNS
+                Effect: Allow
+                Action: sns:Publish
+                Resource: !Ref AlertsTopic
+              - Sid: StepFunctions
+                Effect: Allow
+                Action:
+                  - states:StartExecution
+                  - states:DescribeExecution
+                Resource: !Ref BingPollerStateMachine
+
+  # ── IAM role for Step Functions ───────────────────────────────────────────
+  StepFunctionsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${StackName}-SFNRole"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: states.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: InvokeBingPoller
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !GetAtt BingPollerFunction.Arn
+
+  # ── Step Functions: BingReportPoller ─────────────────────────────────────
+  BingPollerStateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: !Sub "${StackName}-BingReportPoller"
+      RoleArn: !GetAtt StepFunctionsRole.Arn
+      DefinitionString: !Sub |
+        {
+          "Comment": "Polls the Microsoft Advertising Reporting Service until a report is ready.",
+          "StartAt": "SubmitReport",
+          "States": {
+            "SubmitReport": {
+              "Type": "Task",
+              "Resource": "${BingPollerFunction.Arn}",
+              "Parameters": {"task": "submit", "date.$": "$.date", "attempt": 0},
+              "ResultPath": "$.submit_result",
+              "Next": "WaitBeforeFirstPoll",
+              "Catch": [{"ErrorEquals": ["States.ALL"], "Next": "ReportFailed", "ResultPath": "$.error"}]
+            },
+            "WaitBeforeFirstPoll": {"Type": "Wait", "Seconds": 20, "Next": "PollReport"},
+            "PollReport": {
+              "Type": "Task",
+              "Resource": "${BingPollerFunction.Arn}",
+              "Parameters": {
+                "task": "poll",
+                "date.$": "$.date",
+                "report_request_id.$": "$.submit_result.report_request_id",
+                "attempt.$": "$.submit_result.attempt"
+              },
+              "ResultPath": "$.poll_result",
+              "Next": "CheckPollStatus",
+              "Catch": [{"ErrorEquals": ["States.ALL"], "Next": "ReportFailed", "ResultPath": "$.error"}]
+            },
+            "CheckPollStatus": {
+              "Type": "Choice",
+              "Choices": [
+                {"Variable": "$.poll_result.status", "StringEquals": "COMPLETE", "Next": "DownloadReport"},
+                {"And": [{"Variable": "$.poll_result.status", "StringEquals": "PENDING"}, {"Variable": "$.poll_result.attempt", "NumericLessThan": 18}], "Next": "WaitBetweenPolls"}
+              ],
+              "Default": "ReportFailed"
+            },
+            "WaitBetweenPolls": {"Type": "Wait", "Seconds": 20, "Next": "PollReport"},
+            "DownloadReport": {
+              "Type": "Task",
+              "Resource": "${BingPollerFunction.Arn}",
+              "Parameters": {"task": "download", "date.$": "$.date", "report_request_id.$": "$.poll_result.report_request_id"},
+              "ResultPath": "$.download_result",
+              "Next": "ReportComplete",
+              "Catch": [{"ErrorEquals": ["States.ALL"], "Next": "ReportFailed", "ResultPath": "$.error"}]
+            },
+            "ReportComplete": {
+              "Type": "Pass",
+              "Parameters": {"status": "COMPLETE", "s3_key.$": "$.download_result.s3_key", "date.$": "$.date"},
+              "End": true
+            },
+            "ReportFailed": {
+              "Type": "Pass",
+              "Parameters": {"status": "FAILED", "date.$": "$.date"},
+              "End": true
+            }
+          }
+        }
+
+  # ── Lambda: BingPoller ───────────────────────────────────────────────────
+  BingPollerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${StackName}-BingPoller"
+      Runtime: python3.11
+      Handler: bing_poll_handler.lambda_handler
+      Role: !GetAtt AgentLambdaRole.Arn
+      Timeout: 60
+      MemorySize: 256
+      Code:
+        S3Bucket: !Ref CodeBucket
+        S3Key: !Ref BingPollerZipKey
+      Environment:
+        Variables:
+          SECRET_NAME: !Ref SecretName
+          METRICS_BUCKET: !Ref MetricsBucket
+          AWS_REGION_NAME: !Ref AWS::Region
+          LOG_LEVEL: !Ref LogLevel
+
+  # ── Lambda: IngestMetrics ────────────────────────────────────────────────
+  IngestMetricsFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: BingPollerStateMachine
+    Properties:
+      FunctionName: !Sub "${StackName}-IngestMetrics"
+      Runtime: python3.11
+      Handler: ingest_handler.lambda_handler
+      Role: !GetAtt AgentLambdaRole.Arn
+      Timeout: 900
+      MemorySize: 1024
+      Layers:
+        - !Ref SklearnLayerArn
+      Code:
+        S3Bucket: !Ref CodeBucket
+        S3Key: !Ref IngestZipKey
+      Environment:
+        Variables:
+          SECRET_NAME: !Ref SecretName
+          METRICS_TABLE: !Ref CampaignMetricsTable
+          METRICS_BUCKET: !Ref MetricsBucket
+          ALERTS_TOPIC_ARN: !Ref AlertsTopic
+          BING_STATE_MACHINE_ARN: !Ref BingPollerStateMachine
+          CPA_TARGET: !Ref CpaTarget
+          CPA_ALERT_THRESHOLD: !Ref CpaAlertThreshold
+          TARGET_LTV: !Ref TargetLtv
+          AWS_REGION_NAME: !Ref AWS::Region
+          LOG_LEVEL: !Ref LogLevel
+
+  # ── Lambda: RunAgent ─────────────────────────────────────────────────────
+  RunAgentFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${StackName}-RunAgent"
+      Runtime: python3.11
+      Handler: agent_handler.lambda_handler
+      Role: !GetAtt AgentLambdaRole.Arn
+      Timeout: 300
+      MemorySize: 1024
+      Layers:
+        - !Ref SklearnLayerArn
+      Code:
+        S3Bucket: !Ref CodeBucket
+        S3Key: !Ref AgentZipKey
+      Environment:
+        Variables:
+          SECRET_NAME: !Ref SecretName
+          METRICS_TABLE: !Ref CampaignMetricsTable
+          AUDIT_TABLE: !Ref AuditTrailTable
+          METRICS_BUCKET: !Ref MetricsBucket
+          ALERTS_TOPIC_ARN: !Ref AlertsTopic
+          DRY_RUN: !Ref DryRun
+          CPA_TARGET: !Ref CpaTarget
+          CPA_ALERT_THRESHOLD: !Ref CpaAlertThreshold
+          TARGET_LTV: !Ref TargetLtv
+          TOTAL_BUDGET: !Ref TotalBudget
+          BUDGET_INCREASE_CAP: !Ref BudgetIncreaseCap
+          AWS_REGION_NAME: !Ref AWS::Region
+          LOG_LEVEL: !Ref LogLevel
+
+  # ── EventBridge: IngestMetrics schedule (10:00 UTC) ─────────────────────
+  IngestScheduleRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub "${StackName}-IngestSchedule"
+      Description: Triggers IngestMetrics Lambda daily at 10:00 UTC
+      ScheduleExpression: "cron(0 10 * * ? *)"
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt IngestMetricsFunction.Arn
+          Id: IngestMetricsTarget
+
+  IngestSchedulePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref IngestMetricsFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt IngestScheduleRule.Arn
+
+  # ── EventBridge: RunAgent schedule (11:00 UTC) ───────────────────────────
+  AgentScheduleRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub "${StackName}-AgentSchedule"
+      Description: Triggers RunAgent Lambda daily at 11:00 UTC
+      ScheduleExpression: "cron(0 11 * * ? *)"
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt RunAgentFunction.Arn
+          Id: RunAgentTarget
+
+  AgentSchedulePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref RunAgentFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt AgentScheduleRule.Arn
+
+# ---------------------------------------------------------------------------
+# Outputs
+# ---------------------------------------------------------------------------
+Outputs:
+  MetricsBucketName:
+    Description: S3 bucket for raw metrics, normalized data, recommendations, and audit records
+    Value: !Ref MetricsBucket
+
+  CampaignMetricsTableName:
+    Description: DynamoDB table for daily campaign metrics
+    Value: !Ref CampaignMetricsTable
+
+  AuditTrailTableName:
+    Description: DynamoDB table for agent audit trail
+    Value: !Ref AuditTrailTable
+
+  AlertsTopicArn:
+    Description: SNS topic ARN for CPA alerts and error notifications
+    Value: !Ref AlertsTopic
+
+  BingPollerStateMachineArn:
+    Description: Step Functions state machine for Bing report polling
+    Value: !Ref BingPollerStateMachine
+
+  IngestLambdaName:
+    Description: IngestMetrics Lambda function name
+    Value: !Ref IngestMetricsFunction
+
+  AgentLambdaName:
+    Description: RunAgent Lambda function name
+    Value: !Ref RunAgentFunction
+
+  EnableLiveWritesCommand:
+    Description: AWS CLI command to enable live budget/bid mutations
+    Value: !Sub >-
+      aws lambda update-function-configuration
+      --function-name ${RunAgentFunction}
+      --environment Variables={SECRET_NAME=${SecretName},METRICS_TABLE=${CampaignMetricsTable},AUDIT_TABLE=${AuditTrailTable},METRICS_BUCKET=${MetricsBucket},ALERTS_TOPIC_ARN=${AlertsTopic},DRY_RUN=false,CPA_TARGET=${CpaTarget},CPA_ALERT_THRESHOLD=${CpaAlertThreshold},TARGET_LTV=${TargetLtv},TOTAL_BUDGET=${TotalBudget},BUDGET_INCREASE_CAP=${BudgetIncreaseCap},AWS_REGION_NAME=${AWS::Region},LOG_LEVEL=${LogLevel}}

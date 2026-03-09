@@ -1,0 +1,119 @@
+{
+  "Comment": "BingReportPoller — polls the Microsoft Advertising Reporting Service until a report is ready, then downloads it to S3. Invoked synchronously by the IngestMetrics Lambda.",
+  "StartAt": "SubmitReport",
+  "States": {
+    "SubmitReport": {
+      "Type": "Task",
+      "Resource": "${BingPollerFunctionArn}",
+      "Parameters": {
+        "task": "submit",
+        "date.$": "$.date",
+        "attempt": 0
+      },
+      "ResultPath": "$.submit_result",
+      "Next": "WaitBeforeFirstPoll",
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Next": "ReportFailed",
+          "ResultPath": "$.error"
+        }
+      ]
+    },
+
+    "WaitBeforeFirstPoll": {
+      "Type": "Wait",
+      "Seconds": 20,
+      "Next": "PollReport"
+    },
+
+    "PollReport": {
+      "Type": "Task",
+      "Resource": "${BingPollerFunctionArn}",
+      "Parameters": {
+        "task": "poll",
+        "date.$": "$.date",
+        "report_request_id.$": "$.submit_result.report_request_id",
+        "attempt.$": "$.submit_result.attempt"
+      },
+      "ResultPath": "$.poll_result",
+      "Next": "CheckPollStatus",
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Next": "ReportFailed",
+          "ResultPath": "$.error"
+        }
+      ]
+    },
+
+    "CheckPollStatus": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.poll_result.status",
+          "StringEquals": "COMPLETE",
+          "Next": "DownloadReport"
+        },
+        {
+          "And": [
+            {
+              "Variable": "$.poll_result.status",
+              "StringEquals": "PENDING"
+            },
+            {
+              "Variable": "$.poll_result.attempt",
+              "NumericLessThan": 18
+            }
+          ],
+          "Next": "WaitBetweenPolls"
+        }
+      ],
+      "Default": "ReportFailed"
+    },
+
+    "WaitBetweenPolls": {
+      "Type": "Wait",
+      "Seconds": 20,
+      "Next": "PollReport"
+    },
+
+    "DownloadReport": {
+      "Type": "Task",
+      "Resource": "${BingPollerFunctionArn}",
+      "Parameters": {
+        "task": "download",
+        "date.$": "$.date",
+        "report_request_id.$": "$.poll_result.report_request_id"
+      },
+      "ResultPath": "$.download_result",
+      "Next": "ReportComplete",
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Next": "ReportFailed",
+          "ResultPath": "$.error"
+        }
+      ]
+    },
+
+    "ReportComplete": {
+      "Type": "Pass",
+      "Parameters": {
+        "status": "COMPLETE",
+        "s3_key.$": "$.download_result.s3_key",
+        "date.$": "$.date"
+      },
+      "End": true
+    },
+
+    "ReportFailed": {
+      "Type": "Pass",
+      "Parameters": {
+        "status": "FAILED",
+        "date.$": "$.date"
+      },
+      "End": true
+    }
+  }
+}

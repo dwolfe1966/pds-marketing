@@ -1,0 +1,8 @@
+# Lambda deployment dependencies
+# scikit-learn, scipy, numpy are NOT listed here — they come from the Lambda layer.
+# Run: bash layers/build_sklearn_layer.sh to build the layer.
+
+google-ads>=24.1.0
+bingads>=13.0.21
+anthropic>=0.25.0
+boto3>=1.34.0
