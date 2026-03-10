@@ -53,12 +53,15 @@ def main() -> None:
             client_id="placeholder",
             client_secret="placeholder",
             refresh_token="placeholder",
+            customer_id="0000000000",
         ),
         MicrosoftAdsConnector(
             client_id="placeholder",
             client_secret="placeholder",
             tenant_id="placeholder",
             refresh_token="placeholder",
+            customer_id="placeholder",
+            account_id="placeholder",
         ),
     ]
     # Use the helper from ingestion module to fetch campaign/keyword/conversion data.

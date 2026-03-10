@@ -5,7 +5,8 @@
       "Read(//c/Users/dwolf/AppData/Local/Programs/**)",
       "Read(//c/usr/**)",
       "Bash(ls /c/Python*/python.exe)",
-      "Read(//c/Users/dwolf/**)"
+      "Read(//c/Users/dwolf/**)",
+      "Bash(/c/Users/dwolf/.conda/envs/d2l/python.exe:*)"
     ]
   }
 }
